@@ -1,20 +1,21 @@
-// The result of parsing a single file
+// ─── Parse nodes ──────────────────────────────────────────────────────────────
+
 export interface FileNode {
   path: string;
   language: string;
   functions: FunctionNode[];
   classes: ClassNode[];
-  imports: string[];           // resolved file paths this file imports
-  exports: string[];           // exported symbol names
-  lastModified: number;        // unix timestamp
-  size: number;                // bytes
+  imports: string[];
+  exports: string[];
+  lastModified: number;
+  size: number;
 }
 
 export interface FunctionNode {
   name: string;
   startLine: number;
   endLine: number;
-  calls: string[];             // function names this function calls
+  calls: string[];
   params: string[];
   isExported: boolean;
 }
@@ -26,15 +27,17 @@ export interface ClassNode {
   isExported: boolean;
 }
 
-// The full code graph for a repo
+// ─── Code graph ───────────────────────────────────────────────────────────────
+
 export interface CodeGraph {
   files: Map<string, FileNode>;
-  callGraph: Map<string, string[]>;     // functionId -> [called functionIds]
-  importGraph: Map<string, string[]>;   // filePath -> [imported filePaths]
+  callGraph: Map<string, string[]>;    // functionId -> [called functionIds]
+  importGraph: Map<string, string[]>;  // filePath -> [imported filePaths]
   builtAt: number;
 }
 
-// A stored record of a past change or attempt
+// ─── Memory ───────────────────────────────────────────────────────────────────
+
 export interface ChangeRecord {
   id: string;
   timestamp: number;
@@ -45,62 +48,118 @@ export interface ChangeRecord {
   outcome?: 'success' | 'failure' | 'unknown';
 }
 
-// Scored context candidate (a file or function that might be included)
-export interface ContextCandidate {
-  type: 'file' | 'function';
-  path: string;
-  functionName?: string;
-  scores: {
-    relevance: number;       // 0-1: semantic + keyword match to query
-    dependency: number;      // 0-1: normalized graph depth score
-    recency: number;         // 0-1: decay from lastModified
-    errorSignal: number;     // 0-1: linkage to errors/failures
+// ─── Intent ───────────────────────────────────────────────────────────────────
+
+export type TaskIntentType = 'bug_fix' | 'feature' | 'refactor' | 'understand';
+
+export interface TaskIntent {
+  type: TaskIntentType;
+  confidence: number;   // 0–1
+  signals: {
+    errorPatterns: string[];
+    stackFiles: string[];
+    domain: string[];
+    targetSymbols: string[];
   };
-  finalScore: number;        // weighted sum
-  tokenEstimate: number;
 }
 
-// The final structured output Focal returns
-export interface FocalContext {
-  query: string;
-  tokenBudget: number;
-  tokensUsed: number;
-  files: IncludedFile[];
-  summary: string;            // one-paragraph description of what was included and why
-  truncated: boolean;         // true if budget was hit
-  buildTimeMs: number;
+// ─── Runtime signals ──────────────────────────────────────────────────────────
+
+export interface RuntimeSignals {
+  stackTrace?: string;
+  testOutput?: string;
+  recentDiff?: string;     // git diff --name-only or --stat output
+  errorMessage?: string;
 }
+
+export interface PinnedNode {
+  filePath: string;
+  symbol?: string;
+  line?: number;
+  source: 'stack_trace' | 'test_failure' | 'git_diff' | 'manual';
+  errorSignalBoost: number;  // 0–1; overrides computed score
+}
+
+// ─── Retrieval ────────────────────────────────────────────────────────────────
+
+export interface ContextCandidate {
+  type: 'file' | 'function' | 'snippet';
+  path: string;
+  functionName?: string;
+  startLine?: number;
+  endLine?: number;
+  scores: {
+    relevance: number;
+    dependency: number;
+    recency: number;
+    errorSignal: number;
+  };
+  finalScore: number;
+  tokenEstimate: number;
+  pinned?: boolean;
+}
+
+// ─── Output ───────────────────────────────────────────────────────────────────
 
 export interface IncludedFile {
   path: string;
-  content: string;            // actual file content (possibly compressed/summarized)
-  reason: string;             // why this was included
+  repoRoot: string;
+  content: string;
+  reason: string;
   score: number;
-  resolution: 'full' | 'summary' | 'signature-only';
+  resolution: 'full' | 'summary' | 'signature-only' | 'snippet';
+  snippet?: {
+    startLine: number;
+    endLine: number;
+    symbol: string;
+  };
+  runtimeContext?: {
+    appearsInStackTrace: boolean;
+    failingTests: string[];
+  };
+  relatedSymbols: string[];
 }
 
-// Config for a Focal.build() call
+export interface FocalContext {
+  query: string;
+  intent: TaskIntent;
+  tokenBudget: number;
+  tokensUsed: number;
+  files: IncludedFile[];
+  summary: string;
+  truncated: boolean;
+  buildTimeMs: number;
+  graph: {
+    seedFiles: string[];
+    reachableButExcluded: number;
+  };
+  pinnedFiles: string[];
+}
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
 export interface FocalConfig {
-  // V1: single repo. V2: array of repo paths for multi-repo support.
   repoPath: string | string[];
   query: string;
-  tokenBudget?: number;       // default: 8000
+  tokenBudget?: number;
   weights?: {
-    relevance?: number;       // default: 0.4
-    dependency?: number;      // default: 0.25
-    recency?: number;         // default: 0.15
-    errorSignal?: number;     // default: 0.2
+    relevance?: number;
+    dependency?: number;
+    recency?: number;
+    errorSignal?: number;
   };
-  exclude?: string[];         // glob patterns to exclude
-  memoryPath?: string;        // path to store change memory (default: .focal/)
+  exclude?: string[];
+  memoryPath?: string;
 
-  // V2: optional LLM summary callback — bring your own LLM, no Focal dependency
-  // Called when a file is too large for full inclusion but budget remains.
-  // Return a concise summary string to use as the file's content.
+  // Override auto-detected intent
+  intent?: TaskIntentType;
+
+  // Runtime signals — stack traces, test failures, git diffs
+  runtimeSignals?: RuntimeSignals;
+
+  // Optional LLM summarizer — bring your own, Focal has no hard dep
   summarize?: (content: string, query: string, filePath: string) => Promise<string>;
 
-  // V2: optional embedding function — bring your own model, no Focal dependency
-  // Receives an array of texts, returns an array of embedding vectors.
-  // When provided, used to boost relevance scores via cosine similarity.
+  // Optional embedding function — bring your own model
   embed?: (texts: string[]) => Promise<number[][]>;
 }

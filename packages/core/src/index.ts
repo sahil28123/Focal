@@ -3,113 +3,138 @@ import { GraphBuilder } from './graph/builder';
 import { GraphCache } from './graph/cache';
 import { RepoWatcher } from './graph/watcher';
 import { MemoryStore } from './memory/store';
+import { MemoryAutoCollector } from './memory/auto-collector';
+import { IntentClassifier } from './intent/classifier';
+import { RuntimeSignalIngester } from './signals/index';
 import { RetrievalEngine } from './retrieval/engine';
 import { Scorer } from './ranking/scorer';
 import { ContextCompiler } from './compiler/compiler';
 import { FocalConfig, FocalContext } from './types';
 
-// Module-level shared cache — survives across build() calls in the same process.
-// Enables incremental re-parsing: only changed files are re-parsed.
+// Shared parse cache — survives across build() calls, enables incremental updates
 const sharedCache = new GraphCache();
 
 export class Focal {
   /**
    * Build an optimized context package for the given query.
-   * Supports single or multiple repos (V2: repoPath accepts string | string[]).
+   *
+   * New in V2:
+   *   - Intent auto-detection (or override with config.intent)
+   *   - Runtime signals: stack traces, test failures, git diffs
+   *   - Function-level BM25 retrieval
+   *   - Intent-aware scoring profiles
+   *   - Knapsack VPT allocation (replaces greedy)
+   *   - Multi-repo (repoPath: string | string[])
    */
   static async build(config: FocalConfig): Promise<FocalContext> {
     const start = Date.now();
     const cfg = applyDefaults(config);
     const repoPaths = Array.isArray(cfg.repoPath) ? cfg.repoPath : [cfg.repoPath];
 
-    // 1. Parse all repos, using the shared cache for incremental updates
+    // 1. Classify intent
+    const classifier = new IntentClassifier();
+    const intent = cfg.intent
+      ? classifier.fromType(cfg.intent, cfg.query, cfg.runtimeSignals)
+      : classifier.classify(cfg.query, cfg.runtimeSignals);
+
+    // 2. Ingest runtime signals (stack traces, test failures, git diffs)
+    const ingester = new RuntimeSignalIngester();
+    const { pinnedNodes, boostMap } = cfg.runtimeSignals
+      ? ingester.ingest(cfg.runtimeSignals, repoPaths)
+      : { pinnedNodes: [], boostMap: new Map() };
+
+    // 3. Parse repos (incremental — only changed files re-parsed via sharedCache)
     const parser = new Parser(sharedCache);
     const allFiles = (
-      await Promise.all(
-        repoPaths.map((rp) => parser.parseRepo(rp, { exclude: cfg.exclude }))
-      )
+      await Promise.all(repoPaths.map((rp) => parser.parseRepo(rp, { exclude: cfg.exclude })))
     ).flat();
 
-    // 2. Build unified code graph across all repos
+    // 4. Build unified code graph
     const builder = new GraphBuilder();
     const graph = builder.build(allFiles);
 
-    // 3. Init memory (anchored to first repo path)
+    // 5. Init memory store
     const memory = new MemoryStore();
     await memory.init(cfg.memoryPath);
 
-    // 4. Retrieve candidates (TF-IDF + optional embeddings)
+    // 6. Retrieve — function-level BM25 + call graph + runtime boosts + memory
     const retrieval = new RetrievalEngine();
-    const candidates = await retrieval.retrieve(cfg.query, graph, memory, {
-      embed: cfg.embed,
-    });
+    const { candidates, seedFiles } = await retrieval.retrieve(
+      cfg.query,
+      graph,
+      memory,
+      { intent, pinnedNodes, boostMap, embed: cfg.embed }
+    );
 
-    // 5. Score and rank
+    // 7. Score with intent-weighted profiles
     const scorer = new Scorer();
-    const ranked = scorer.score(candidates, cfg.weights, graph.files);
+    const ranked = scorer.score(candidates, intent, cfg.weights, graph.files);
 
-    // 6. Compile context (with optional LLM summarize callback)
+    // 8. Compile with knapsack VPT allocation
     const compiler = new ContextCompiler();
     const context = await compiler.compile(ranked, {
-      ...cfg,
+      query: cfg.query,
+      tokenBudget: cfg.tokenBudget,
+      repoPath: cfg.repoPath,
+      intent,
       fileNodes: graph.files,
+      pinnedNodes,
       summarize: cfg.summarize,
+      totalCandidates: candidates.length,
     });
+
+    // Patch in seed files from retrieval
+    context.graph.seedFiles = seedFiles;
+
+    // 9. Auto-record this build in memory (async, non-blocking)
+    const collector = new MemoryAutoCollector(memory);
+    collector.recordBuild(context).catch(() => { /* non-fatal */ });
 
     return { ...context, buildTimeMs: Date.now() - start };
   }
 
   /**
-   * Watch repos for changes and rebuild context incrementally on every change.
+   * Watch repos and rebuild context on every file change.
    * Uses Node's built-in fs.watch — zero external dependencies.
    *
-   * Returns a stop() function to tear down the watcher.
+   * @returns A stop() function that tears down all watchers.
    *
    * @example
-   * const stop = Focal.watch(config, (ctx) => {
-   *   console.log('Context updated:', ctx.summary);
-   * });
-   * // later...
-   * stop();
+   * const stop = Focal.watch(config, (ctx) => sendToAgent(ctx));
+   * // later: stop();
    */
   static watch(
     config: FocalConfig,
     onUpdate: (context: FocalContext) => void,
     onError?: (err: Error) => void
   ): () => void {
-    const cfg = applyDefaults(config);
-    const repoPaths = Array.isArray(cfg.repoPath) ? cfg.repoPath : [cfg.repoPath];
+    const repoPaths = Array.isArray(config.repoPath) ? config.repoPath : [config.repoPath];
 
-    // Build initial context immediately
-    Focal.build(config).then(onUpdate).catch((err) => onError?.(err));
+    // Initial build
+    Focal.build(config).then(onUpdate).catch((e) => onError?.(e as Error));
 
-    let rebuildQueued = false;
-
+    let pending = false;
     const watcher = new RepoWatcher();
 
     watcher.on('change', (event: { filePath: string }) => {
-      // Invalidate the cache entry for the changed file so it gets re-parsed
       sharedCache.invalidate(event.filePath);
-
-      // Debounce rapid cascading changes into a single rebuild
-      if (rebuildQueued) return;
-      rebuildQueued = true;
-
+      if (pending) return;
+      pending = true;
       setTimeout(() => {
-        rebuildQueued = false;
-        Focal.build(config).then(onUpdate).catch((err) => onError?.(err));
+        pending = false;
+        Focal.build(config).then(onUpdate).catch((e) => onError?.(e as Error));
       }, 300);
     });
 
     watcher.watch(repoPaths);
-
     return () => watcher.stop();
   }
 }
 
+// ─── Defaults ─────────────────────────────────────────────────────────────────
+
 type ResolvedWeights = Required<NonNullable<FocalConfig['weights']>>;
-type ResolvedConfig = Omit<FocalConfig, 'repoPath' | 'tokenBudget' | 'exclude' | 'memoryPath' | 'weights'> & {
-  repoPath: string | string[];
+type ResolvedConfig = FocalConfig & {
   tokenBudget: number;
   exclude: string[];
   memoryPath: string;
@@ -117,13 +142,10 @@ type ResolvedConfig = Omit<FocalConfig, 'repoPath' | 'tokenBudget' | 'exclude' |
 };
 
 function applyDefaults(config: FocalConfig): ResolvedConfig {
-  const defaultWeights: ResolvedWeights = {
-    relevance: 0.4,
-    dependency: 0.25,
-    recency: 0.15,
-    errorSignal: 0.2,
-  };
   const firstRepo = Array.isArray(config.repoPath) ? config.repoPath[0] : config.repoPath;
+  const defaultWeights: ResolvedWeights = {
+    relevance: 0.4, dependency: 0.25, recency: 0.15, errorSignal: 0.2,
+  };
   return {
     tokenBudget: 8000,
     exclude: ['node_modules', '.git', 'dist', 'build', '*.test.*', '*.spec.*'],
@@ -133,7 +155,17 @@ function applyDefaults(config: FocalConfig): ResolvedConfig {
   };
 }
 
-export type { FocalConfig, FocalContext, IncludedFile, ChangeRecord, CodeGraph } from './types';
-export { MemoryStore } from './memory/store';
-export { GraphCache } from './graph/cache';
-export { RepoWatcher } from './graph/watcher';
+// ─── Public exports ───────────────────────────────────────────────────────────
+
+export type {
+  FocalConfig, FocalContext, IncludedFile, ChangeRecord, CodeGraph,
+  TaskIntent, TaskIntentType, RuntimeSignals, PinnedNode,
+} from './types';
+
+export { MemoryStore }         from './memory/store';
+export { MemoryAutoCollector } from './memory/auto-collector';
+export { GraphCache }          from './graph/cache';
+export { RepoWatcher }         from './graph/watcher';
+export { FocalFormatter }      from './formatter/index';
+export { IntentClassifier }    from './intent/classifier';
+export { RuntimeSignalIngester, parseStackTrace, parseTestOutput, parseGitDiff } from './signals/index';
