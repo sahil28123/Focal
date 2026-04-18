@@ -1,0 +1,15 @@
+{
+  "name": "@focal/cli",
+  "version": "0.1.0",
+  "bin": {
+    "focal": "dist/index.js"
+  },
+  "dependencies": {
+    "@focal/core": "*",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

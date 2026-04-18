@@ -1,0 +1,10 @@
+{
+  "name": "focal",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "tsc -b packages/core packages/cli",
+    "dev": "tsc -b --watch",
+    "test": "jest"
+  }
+}

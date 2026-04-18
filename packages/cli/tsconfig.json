@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "paths": {
+      "@focal/core": ["../core/src/index"]
+    }
+  },
+  "include": ["src/**/*"],
+  "references": [{ "path": "../core" }]
+}
