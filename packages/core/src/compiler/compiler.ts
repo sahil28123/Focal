@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   ContextCandidate, FocalConfig, FocalContext, IncludedFile, FileNode, TaskIntent, PinnedNode,
+  SummarizeInput, CodeGraph,
 } from '../types';
 
 export function estimateTokens(text: string): number {
@@ -75,6 +76,8 @@ type CompileConfig = {
   fileNodes?: Map<string, FileNode>;
   pinnedNodes?: PinnedNode[];
   summarize?: FocalConfig['summarize'];
+  summarizeEnriched?: FocalConfig['summarizeEnriched'];
+  graph?: CodeGraph;
   totalCandidates: number;
 };
 
@@ -137,9 +140,8 @@ export class ContextCompiler {
           });
         }
 
-        // LLM summary (will be fetched lazily during allocation if selected)
-        if (config.summarize) {
-          // Estimate summary tokens as ~15% of full file
+        // LLM summary — enriched (preferred) or plain
+        if (config.summarizeEnriched || config.summarize) {
           const estSumTokens = Math.ceil(fullTokens * 0.15);
           const summaryValue = c.finalScore * RESOLUTION_VALUE['summary'];
           variants.push({
@@ -183,11 +185,18 @@ export class ContextCompiler {
       } else if (resolution === 'signature-only') {
         const fileNode = config.fileNodes?.get(fp);
         if (fileNode) content = extractSignatures(content, fileNode);
-      } else if (resolution === 'summary' && config.summarize) {
+      } else if (resolution === 'summary' && (config.summarizeEnriched || config.summarize)) {
         try {
-          content = await config.summarize(content, config.query, fp);
+          if (config.summarizeEnriched && config.graph) {
+            const input = this.buildSummarizeInput(
+              content, config.query, fp, config.intent,
+              variant.candidate, config.graph, allocatedPaths
+            );
+            content = await config.summarizeEnriched(input);
+          } else if (config.summarize) {
+            content = await config.summarize(content, config.query, fp);
+          }
         } catch {
-          // Fall back to signatures if summarize throws
           const fileNode = config.fileNodes?.get(fp);
           if (fileNode) {
             content = extractSignatures(content, fileNode);
@@ -268,6 +277,76 @@ export class ContextCompiler {
         reachableButExcluded,
       },
       pinnedFiles: (config.pinnedNodes ?? []).map((p) => p.filePath),
+      // Placeholder — overwritten by ConfidenceEstimator in index.ts
+      confidence: {
+        overall: 0,
+        verdict: 'medium' as const,
+        breakdown: { signalCoverage: 0, topCandidateScore: 0, memoryPatternHits: 0, budgetUtilization: 0, diversityScore: 0 },
+        warnings: [],
+      },
+    };
+  }
+
+  private buildSummarizeInput(
+    content: string,
+    query: string,
+    filePath: string,
+    intent: TaskIntent,
+    candidate: ContextCandidate,
+    graph: CodeGraph,
+    allocatedPaths: Set<string>
+  ): SummarizeInput {
+    const imports = graph.importGraph.get(filePath) ?? [];
+    const importedByInContext: string[] = [];
+    const importsInContext: string[] = [];
+
+    for (const [fp, imps] of graph.importGraph) {
+      if (imps.includes(filePath) && allocatedPaths.has(fp)) {
+        importedByInContext.push(fp);
+      }
+    }
+    for (const imp of imports) {
+      if (allocatedPaths.has(imp)) importsInContext.push(imp);
+    }
+
+    // Calls symbols: functions this file's functions call that are in other context files
+    const callsSymbols: string[] = [];
+    const fileNode = graph.files.get(filePath);
+    if (fileNode) {
+      for (const fn of fileNode.functions) {
+        const fnId = `${filePath}::${fn.name}`;
+        for (const callee of graph.callGraph.get(fnId) ?? []) {
+          const calleeFile = callee.split('::')[0];
+          if (allocatedPaths.has(calleeFile)) callsSymbols.push(callee.split('::')[1]);
+        }
+      }
+    }
+
+    // Called by: functions in other context files that call into this file
+    const calledBySymbols: string[] = [];
+    for (const [fnId, callees] of graph.callGraph) {
+      const callerFile = fnId.split('::')[0];
+      if (!allocatedPaths.has(callerFile)) continue;
+      for (const callee of callees) {
+        if (callee.startsWith(filePath + '::')) {
+          calledBySymbols.push(fnId.split('::')[1]);
+        }
+      }
+    }
+
+    const role: SummarizeInput['role'] =
+      candidate.pinned ? 'error_site' :
+      importedByInContext.length > 0 ? 'dependency' :
+      calledBySymbols.length > 0 ? 'caller' : 'related';
+
+    return {
+      content, query, filePath, intent, role,
+      relationships: {
+        importedByInContext,
+        importsInContext,
+        calledBySymbols: [...new Set(calledBySymbols)],
+        callsSymbols: [...new Set(callsSymbols)],
+      },
     };
   }
 

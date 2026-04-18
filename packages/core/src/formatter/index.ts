@@ -49,25 +49,76 @@ export class FocalFormatter {
    * Paste this into the system prompt or before the context block.
    */
   toPreamble(context: FocalContext): string {
+    const conf = context.confidence;
     const lines: string[] = [
       `<focal_preamble>`,
-      `Query: ${context.query}`,
-      `Intent: ${context.intent.type} (confidence: ${Math.round(context.intent.confidence * 100)}%)`,
-      `Context: ${context.files.length} files, ${context.tokensUsed}/${context.tokenBudget} tokens used`,
+      `Query:      ${context.query}`,
+      `Intent:     ${context.intent.type} (${Math.round(context.intent.confidence * 100)}% confidence)`,
+      `Confidence: ${conf.verdict} (${(conf.overall * 100).toFixed(0)}%)`,
+      `Context:    ${context.files.length} files — ${context.tokensUsed}/${context.tokenBudget} tokens`,
     ];
 
+    if (context.executionPath) {
+      const ep = context.executionPath;
+      const chain = ep.nodes.map((n) =>
+        `${path.basename(n.filePath)}${n.functionName ? `::${n.functionName}` : ''}${n.isErrorSite ? ' [ERROR]' : ''}`
+      ).join(' → ');
+      lines.push(`Execution:  ${chain} (path confidence: ${(ep.confidence * 100).toFixed(0)}%)`);
+    }
+
     if (context.pinnedFiles.length > 0) {
-      lines.push(`Pinned (from runtime signals): ${context.pinnedFiles.map((p) => path.basename(p)).join(', ')}`);
+      lines.push(`Pinned:     ${context.pinnedFiles.map((p) => path.basename(p)).join(', ')}`);
     }
     if (context.graph.reachableButExcluded > 0) {
-      lines.push(`${context.graph.reachableButExcluded} additional reachable files excluded by token budget`);
+      lines.push(`Excluded:   ${context.graph.reachableButExcluded} reachable files cut by token budget`);
+    }
+    if (conf.warnings.length > 0) {
+      for (const w of conf.warnings) lines.push(`⚠ ${w}`);
     }
     if (context.truncated) {
-      lines.push(`Note: context was truncated — some relevant files were excluded`);
+      lines.push(`⚠ Context truncated — increase tokenBudget for full coverage`);
     }
 
     lines.push(`</focal_preamble>`);
     return lines.join('\n');
+  }
+
+  /** Format the execution path as a standalone structured block. */
+  formatExecutionPath(context: FocalContext, style: FormatStyle = 'xml-tags'): string {
+    if (!context.executionPath) return '';
+    const ep = context.executionPath;
+
+    if (style === 'xml-tags') {
+      const frames = ep.nodes.map((n) => {
+        const attrs = [
+          `path="${escapeAttr(path.basename(n.filePath))}"`,
+          n.functionName ? `symbol="${n.functionName}"` : '',
+          n.line ? `line="${n.line}"` : '',
+          `verified="${n.verified}"`,
+          n.isErrorSite ? `error_site="true"` : '',
+          n.isEntryPoint ? `entry_point="true"` : '',
+        ].filter(Boolean).join(' ');
+        return `  <frame ${attrs} />`;
+      });
+      return [
+        `<focal_execution_path confidence="${(ep.confidence * 100).toFixed(0)}%">`,
+        ...frames,
+        `</focal_execution_path>`,
+      ].join('\n');
+    }
+
+    if (style === 'markdown') {
+      const chain = ep.nodes.map((n) => {
+        const sym = n.functionName ? `\`${n.functionName}\`` : path.basename(n.filePath);
+        const tag = n.isErrorSite ? ' **[ERROR]**' : n.isEntryPoint ? ' *(entry)*' : '';
+        return sym + tag;
+      }).join(' → ');
+      return `**Execution path** (${(ep.confidence * 100).toFixed(0)}% verified): ${chain}`;
+    }
+
+    return ep.nodes.map((n) =>
+      `${n.isEntryPoint ? '→ ' : '  '}${path.basename(n.filePath)}${n.functionName ? `::${n.functionName}` : ''}${n.isErrorSite ? ' [ERROR SITE]' : ''}`
+    ).join('\n');
   }
 
   // ── XML tags (Claude-optimized) ─────────────────────────────────────────────
@@ -76,13 +127,18 @@ export class FocalFormatter {
     const attrs = [
       `intent="${context.intent.type}"`,
       `query="${escapeAttr(context.query)}"`,
+      `confidence="${context.confidence.verdict}"`,
       opts.includeScores ? `tokens_used="${context.tokensUsed}"` : '',
     ].filter(Boolean).join(' ');
 
     const fileParts = context.files.map((f) => this.fileToXml(f, opts));
+    const execPath = context.executionPath
+      ? [this.formatExecutionPath(context, 'xml-tags'), '']
+      : [];
 
     return [
       `<focal_context ${attrs}>`,
+      ...execPath,
       ...fileParts,
       `</focal_context>`,
     ].join('\n');

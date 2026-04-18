@@ -1,6 +1,8 @@
 import * as fs from 'fs';
 import { CodeGraph, ContextCandidate, TaskIntent, PinnedNode } from '../types';
 import { MemoryStore } from '../memory/store';
+import { FailurePatternIndex } from '../memory/pattern-index';
+import { BreakagePredictor } from '../prediction/breakage';
 import { TFIDFIndex, TFIDFDocument, cosineSimilarity } from './tfidf';
 
 export interface RetrievalOptions {
@@ -11,9 +13,12 @@ export interface RetrievalOptions {
   embed?: (texts: string[]) => Promise<number[][]>;
 }
 
+export { FailurePatternIndex };
+
 export interface RetrievalResult {
   candidates: ContextCandidate[];
   seedFiles: string[];
+  patternHits: number;   // how many failure patterns matched — used for confidence estimation
 }
 
 // A function-level candidate scores higher than its file average by this ratio
@@ -59,7 +64,7 @@ export class RetrievalEngine {
 
     const allFilePaths = [...graph.files.keys()];
     if (allFilePaths.length === 0) {
-      return { candidates: [], seedFiles: [] };
+      return { candidates: [], seedFiles: [], patternHits: 0 };
     }
 
     // ── Step 1: Read file contents ───────────────────────────────────────────
@@ -229,30 +234,59 @@ export class RetrievalEngine {
       }
     }
 
-    // ── Step 9: Memory linkage — error signal from past records ───────────────
+    // ── Step 9: Memory linkage — error signal from past records + pattern index ─
     const candidateFiles = allFilePaths.filter(
       (p) => (relevanceByFile.get(p) ?? 0) > 0 || depScore.has(p) || boostMap.has(p)
     );
     const memoryRecords = await memory.getForFiles(candidateFiles);
 
+    // Build failure pattern index from all records (not just candidate files)
+    const allRecords = await memory.getRecent(500);
+    const patternIndex = new FailurePatternIndex();
+    patternIndex.build(allRecords);
+    const patternBoosts = patternIndex.getBoosts(query);
+
     const queryTokens = tokenizeQuery(query);
     const errorSignalByFile = new Map<string, number>();
 
-    // Apply runtime signal boosts first
+    // 1. Runtime signal boosts (highest priority — directly from stack traces etc.)
     for (const [fp, boost] of boostMap) {
       errorSignalByFile.set(fp, boost);
     }
 
-    // Then layer in memory-derived error signal
+    // 2. Failure pattern boosts (from past similar failures)
+    for (const [fp, boost] of patternBoosts) {
+      errorSignalByFile.set(fp, Math.min(1, (errorSignalByFile.get(fp) ?? 0) + boost * 0.6));
+    }
+
+    // 3. Memory record linkage (simple overlap — kept for non-failure records)
     for (const record of memoryRecords) {
       const descTokens = tokenizeQuery(record.description);
       const overlap =
         descTokens.filter((t) => queryTokens.includes(t)).length /
         Math.max(queryTokens.length, 1);
-      const boost = overlap * (record.outcome === 'failure' ? 1.0 : 0.5);
+      const boost = overlap * (record.outcome === 'failure' ? 1.0 : 0.4);
       if (boost < 0.1) continue;
       for (const file of record.files) {
         errorSignalByFile.set(file, Math.min(1, (errorSignalByFile.get(file) ?? 0) + boost));
+      }
+    }
+
+    // ── Step 9b: Breakage prediction — add at-risk callers ───────────────────
+    // Only for bug_fix and refactor — don't expand scope for feature/understand
+    const intentType2 = intent?.type ?? 'understand';
+    if ((intentType2 === 'bug_fix' || intentType2 === 'refactor') && pinnedNodes.length > 0) {
+      const predictor = new BreakagePredictor();
+      const risks = predictor.predict(pinnedNodes, graph, []);
+      const riskCandidates = predictor.toContextCandidates(risks, graph);
+      // Merge risk candidates' errorSignal into the map
+      for (const rc of riskCandidates) {
+        errorSignalByFile.set(
+          rc.path,
+          Math.min(1, (errorSignalByFile.get(rc.path) ?? 0) + rc.scores.errorSignal)
+        );
+        // Also add them to depScore so they reach the candidate list
+        depScore.set(rc.path, Math.max(depScore.get(rc.path) ?? 0, rc.scores.dependency));
       }
     }
 
@@ -363,6 +397,7 @@ export class RetrievalEngine {
     return {
       candidates: [...pinned, ...nonPinned],
       seedFiles: [...seedSet].slice(0, 10),
+      patternHits: patternIndex.matchCount(query),
     };
   }
 }

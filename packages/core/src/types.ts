@@ -54,7 +54,7 @@ export type TaskIntentType = 'bug_fix' | 'feature' | 'refactor' | 'understand';
 
 export interface TaskIntent {
   type: TaskIntentType;
-  confidence: number;   // 0–1
+  confidence: number;
   signals: {
     errorPatterns: string[];
     stackFiles: string[];
@@ -68,7 +68,7 @@ export interface TaskIntent {
 export interface RuntimeSignals {
   stackTrace?: string;
   testOutput?: string;
-  recentDiff?: string;     // git diff --name-only or --stat output
+  recentDiff?: string;
   errorMessage?: string;
 }
 
@@ -77,7 +77,27 @@ export interface PinnedNode {
   symbol?: string;
   line?: number;
   source: 'stack_trace' | 'test_failure' | 'git_diff' | 'manual';
-  errorSignalBoost: number;  // 0–1; overrides computed score
+  errorSignalBoost: number;
+}
+
+// ─── Execution path ───────────────────────────────────────────────────────────
+
+export interface PathNode {
+  filePath: string;
+  functionName?: string;
+  line?: number;
+  /** true = hop verified by call graph; false = inferred from stack trace order */
+  verified: boolean;
+  isErrorSite: boolean;
+  isEntryPoint: boolean;
+}
+
+export interface ExecutionPath {
+  nodes: PathNode[];        // ordered entry → error
+  errorSite: PathNode;
+  entryPoint: PathNode;
+  /** fraction of consecutive hops that were verified via call graph (0–1) */
+  confidence: number;
 }
 
 // ─── Retrieval ────────────────────────────────────────────────────────────────
@@ -97,6 +117,21 @@ export interface ContextCandidate {
   finalScore: number;
   tokenEstimate: number;
   pinned?: boolean;
+}
+
+// ─── Confidence ───────────────────────────────────────────────────────────────
+
+export interface ContextConfidence {
+  overall: number;          // 0–1
+  verdict: 'high' | 'medium' | 'low';
+  breakdown: {
+    signalCoverage: number;    // fraction of pinned files actually included
+    topCandidateScore: number; // finalScore of highest-ranked file
+    memoryPatternHits: number; // 0–1: did memory patterns fire?
+    budgetUtilization: number; // tokensUsed / tokenBudget
+    diversityScore: number;    // 0–1: how many distinct directories represented
+  };
+  warnings: string[];       // e.g. "top candidate score is 0.2 — query may be too vague"
 }
 
 // ─── Output ───────────────────────────────────────────────────────────────────
@@ -134,6 +169,47 @@ export interface FocalContext {
     reachableButExcluded: number;
   };
   pinnedFiles: string[];
+  confidence: ContextConfidence;
+  executionPath?: ExecutionPath;
+}
+
+// ─── Incremental delta ────────────────────────────────────────────────────────
+
+export interface IncrementalDelta {
+  /** Files newly added to context (not in previous) */
+  added: IncludedFile[];
+  /** Files in both contexts but whose content changed */
+  changed: IncludedFile[];
+  /** File paths that dropped out of context */
+  removed: string[];
+  /** File paths still in context, unchanged (content omitted to save tokens) */
+  unchanged: string[];
+  tokensUsed: number;
+  tokensSaved: number;
+  buildTimeMs: number;
+  summary: string;
+}
+
+// ─── Enriched summarization ───────────────────────────────────────────────────
+
+/** Richer context passed to summarizeEnriched() — explains relationships, not just content. */
+export interface SummarizeInput {
+  content: string;
+  query: string;
+  filePath: string;
+  intent: TaskIntent;
+  /** Role this file plays relative to the query */
+  role: 'error_site' | 'caller' | 'dependency' | 'related';
+  relationships: {
+    /** Other files in this context that import this file */
+    importedByInContext: string[];
+    /** Files this file imports that are also in context */
+    importsInContext: string[];
+    /** Function names in other context files that call into this file */
+    calledBySymbols: string[];
+    /** External function names this file calls */
+    callsSymbols: string[];
+  };
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -151,15 +227,22 @@ export interface FocalConfig {
   exclude?: string[];
   memoryPath?: string;
 
-  // Override auto-detected intent
+  /** Override auto-detected intent */
   intent?: TaskIntentType;
 
-  // Runtime signals — stack traces, test failures, git diffs
+  /** Runtime signals — stack traces, test failures, git diffs */
   runtimeSignals?: RuntimeSignals;
 
-  // Optional LLM summarizer — bring your own, Focal has no hard dep
+  /** Simple summarizer: receives (content, query, filePath) */
   summarize?: (content: string, query: string, filePath: string) => Promise<string>;
 
-  // Optional embedding function — bring your own model
+  /**
+   * Enriched summarizer: receives full relationship context.
+   * Takes priority over `summarize` when both are provided.
+   * Produces higher-quality summaries because it knows why the file matters.
+   */
+  summarizeEnriched?: (input: SummarizeInput) => Promise<string>;
+
+  /** Optional embedding function — bring your own model */
   embed?: (texts: string[]) => Promise<number[][]>;
 }
