@@ -11,7 +11,6 @@ function extractSignatures(fileContent: string, fileNode: FileNode): string {
   const importLines: string[] = [];
   const signatureLines: string[] = [];
 
-  // Collect import lines
   for (const line of lines) {
     const trimmed = line.trim();
     if (
@@ -23,16 +22,12 @@ function extractSignatures(fileContent: string, fileNode: FileNode): string {
     }
   }
 
-  // Collect function/class signatures (first line of each)
   for (const fn of fileNode.functions) {
     const sigLine = lines[fn.startLine - 1];
     if (sigLine) signatureLines.push(sigLine);
   }
   for (const cls of fileNode.classes) {
-    // Find the class declaration line
-    const clsLine = lines.findIndex((l) =>
-      l.includes(`class ${cls.name}`)
-    );
+    const clsLine = lines.findIndex((l) => l.includes(`class ${cls.name}`));
     if (clsLine >= 0) signatureLines.push(lines[clsLine] + ' { ... }');
   }
 
@@ -45,16 +40,24 @@ function extractSignatures(fileContent: string, fileNode: FileNode): string {
   ].join('\n');
 }
 
+type CompileConfig = Required<Pick<FocalConfig, 'query' | 'tokenBudget' | 'repoPath'>> & {
+  fileNodes?: Map<string, FileNode>;
+  summarize?: FocalConfig['summarize'];
+};
+
 export class ContextCompiler {
   async compile(
     candidates: ContextCandidate[],
-    config: Required<Pick<FocalConfig, 'query' | 'tokenBudget' | 'repoPath'>> & {
-      fileNodes?: Map<string, FileNode>;
-    }
+    config: CompileConfig
   ): Promise<FocalContext> {
     let remainingBudget = config.tokenBudget;
     const includedFiles: IncludedFile[] = [];
     let truncated = false;
+
+    // Use first repo path for relative display if multi-repo
+    const baseRepo = Array.isArray(config.repoPath)
+      ? config.repoPath[0]
+      : config.repoPath;
 
     for (const candidate of candidates) {
       if (remainingBudget <= 0) {
@@ -72,7 +75,7 @@ export class ContextCompiler {
       const fullTokens = estimateTokens(content);
 
       if (fullTokens <= remainingBudget) {
-        // Include full file
+        // Full file fits
         includedFiles.push({
           path: candidate.path,
           content,
@@ -81,8 +84,27 @@ export class ContextCompiler {
           resolution: 'full',
         });
         remainingBudget -= fullTokens;
+      } else if (config.summarize && remainingBudget >= config.tokenBudget * 0.15) {
+        // LLM summary — user-provided callback, no Focal dependency on any LLM
+        try {
+          const summaryText = await config.summarize(content, config.query, candidate.path);
+          const summaryTokens = estimateTokens(summaryText);
+          if (summaryTokens <= remainingBudget) {
+            includedFiles.push({
+              path: candidate.path,
+              content: summaryText,
+              reason: this.buildReason(candidate) + ' (LLM summary — full file exceeds budget)',
+              score: candidate.finalScore,
+              resolution: 'summary',
+            });
+            remainingBudget -= summaryTokens;
+          }
+        } catch {
+          // Fall through to signature-only if summarize throws
+          this.trySignatureOnly(candidate, content, config, includedFiles, remainingBudget);
+        }
       } else if (remainingBudget >= config.tokenBudget * 0.4) {
-        // Include signatures only
+        // Signature-only fallback
         const fileNode = config.fileNodes?.get(candidate.path);
         if (fileNode) {
           const sigContent = extractSignatures(content, fileNode);
@@ -107,7 +129,7 @@ export class ContextCompiler {
     const tokensUsed = config.tokenBudget - remainingBudget;
     const top3 = includedFiles
       .slice(0, 3)
-      .map((f) => path.basename(f.path))
+      .map((f) => path.relative(baseRepo, f.path))
       .join(', ');
 
     const summary =
@@ -122,13 +144,35 @@ export class ContextCompiler {
       files: includedFiles,
       summary,
       truncated,
-      buildTimeMs: 0, // set by caller
+      buildTimeMs: 0,
     };
+  }
+
+  private trySignatureOnly(
+    candidate: ContextCandidate,
+    content: string,
+    config: CompileConfig,
+    includedFiles: IncludedFile[],
+    remainingBudget: number
+  ): void {
+    const fileNode = config.fileNodes?.get(candidate.path);
+    if (!fileNode) return;
+    const sigContent = extractSignatures(content, fileNode);
+    const sigTokens = estimateTokens(sigContent);
+    if (sigTokens <= remainingBudget) {
+      includedFiles.push({
+        path: candidate.path,
+        content: sigContent,
+        reason: this.buildReason(candidate) + ' (signatures only — full file exceeds budget)',
+        score: candidate.finalScore,
+        resolution: 'signature-only',
+      });
+    }
   }
 
   private buildReason(candidate: ContextCandidate): string {
     const reasons: string[] = [];
-    if (candidate.scores.relevance > 0.3) reasons.push('keyword match');
+    if (candidate.scores.relevance > 0.3) reasons.push('keyword/semantic match');
     if (candidate.scores.dependency > 0.3) reasons.push('import dependency');
     if (candidate.scores.errorSignal > 0.3) reasons.push('related past changes');
     if (candidate.scores.recency > 0.7) reasons.push('recently modified');

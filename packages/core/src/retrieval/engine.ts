@@ -1,9 +1,9 @@
 import * as fs from 'fs';
 import { CodeGraph, ContextCandidate } from '../types';
 import { MemoryStore } from '../memory/store';
+import { TFIDFIndex, TFIDFDocument, cosineSimilarity } from './tfidf';
 
 function tokenizeQuery(query: string): string[] {
-  // Split on spaces, camelCase, snake_case, and punctuation
   return query
     .replace(/([a-z])([A-Z])/g, '$1 $2')
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
@@ -22,61 +22,125 @@ function keywordScore(tokens: string[], text: string): number {
   return tokens.length > 0 ? matches / tokens.length : 0;
 }
 
+export interface RetrievalOptions {
+  topK?: number;
+  embed?: (texts: string[]) => Promise<number[][]>;
+}
+
 export class RetrievalEngine {
   async retrieve(
     query: string,
     graph: CodeGraph,
     memory: MemoryStore,
-    options?: { topK?: number }
+    options?: RetrievalOptions
   ): Promise<ContextCandidate[]> {
     const topK = options?.topK ?? 50;
     const tokens = tokenizeQuery(query);
     const allFilePaths = [...graph.files.keys()];
 
-    // Step 1: Keyword match for each file
+    // Read all file contents upfront (needed for TF-IDF and keyword scoring)
+    const contentMap = new Map<string, string>();
+    await Promise.all(
+      allFilePaths.map(async (filePath) => {
+        try {
+          const content = await fs.promises.readFile(filePath, 'utf8');
+          contentMap.set(filePath, content);
+        } catch {
+          // Skip unreadable files
+        }
+      })
+    );
+
+    // Step 1: Build TF-IDF index over all files
+    const tfidf = new TFIDFIndex();
+    const docs: TFIDFDocument[] = [];
+    for (const [filePath, fileNode] of graph.files) {
+      const content = contentMap.get(filePath) ?? '';
+      const fnNames = fileNode.functions.map((f) => f.name).join(' ');
+      const clsNames = fileNode.classes.map((c) => c.name).join(' ');
+      docs.push({ id: filePath, text: `${filePath} ${fnNames} ${clsNames} ${content}` });
+    }
+    tfidf.build(docs);
+    const tfidfScores = tfidf.query(query);
+
+    // Step 2: Optional embedding similarity boost
+    const embeddingScores = new Map<string, number>();
+    if (options?.embed && allFilePaths.length > 0) {
+      try {
+        const textsToEmbed = [query, ...allFilePaths.map((p) => {
+          const fileNode = graph.files.get(p)!;
+          const content = contentMap.get(p) ?? '';
+          // Use a compact representation for embedding: path + symbols + first 500 chars
+          const symbols = [
+            ...fileNode.functions.map((f) => f.name),
+            ...fileNode.classes.map((c) => c.name),
+          ].join(' ');
+          return `${p} ${symbols} ${content.slice(0, 500)}`;
+        })];
+
+        const vectors = await options.embed(textsToEmbed);
+        const queryVec = vectors[0];
+
+        for (let i = 0; i < allFilePaths.length; i++) {
+          const sim = cosineSimilarity(queryVec, vectors[i + 1]);
+          embeddingScores.set(allFilePaths[i], Math.max(0, sim));
+        }
+
+        // Normalize embedding scores to 0-1
+        const maxSim = Math.max(...embeddingScores.values(), 0.001);
+        for (const [k, v] of embeddingScores) {
+          embeddingScores.set(k, v / maxSim);
+        }
+      } catch {
+        // If embedding fails, fall back to TF-IDF only
+      }
+    }
+
+    // Step 3: Combine TF-IDF + keyword + optional embedding into relevance score
     const relevanceMap = new Map<string, number>();
     for (const [filePath, fileNode] of graph.files) {
       const pathScore = keywordScore(tokens, filePath);
-      let contentScore = 0;
-      try {
-        const content = await fs.promises.readFile(filePath, 'utf8');
-        contentScore = keywordScore(tokens, content) * 0.5; // content weighted less than path/name
-      } catch {
-        // Skip unreadable files
-      }
-      const fnScore = fileNode.functions.reduce((max, fn) => {
-        return Math.max(max, keywordScore(tokens, fn.name));
-      }, 0);
-      relevanceMap.set(filePath, Math.min(1, pathScore * 0.4 + fnScore * 0.3 + contentScore * 0.3));
+      const fnScore = fileNode.functions.reduce(
+        (max, fn) => Math.max(max, keywordScore(tokens, fn.name)),
+        0
+      );
+      const tfidf = tfidfScores.get(filePath) ?? 0;
+      const embedding = embeddingScores.get(filePath) ?? 0;
+
+      // Blend: TF-IDF (0.5) + keyword path/fn (0.3) + embedding (0.2 if available, else redistribute)
+      const hasEmbedding = options?.embed !== undefined;
+      const score = hasEmbedding
+        ? tfidf * 0.5 + (pathScore * 0.5 + fnScore * 0.5) * 0.3 + embedding * 0.2
+        : tfidf * 0.6 + (pathScore * 0.5 + fnScore * 0.5) * 0.4;
+
+      relevanceMap.set(filePath, Math.min(1, score));
     }
 
-    // Step 2: Identify seed files (top keyword matches)
+    // Step 4: Identify seed files (top relevance matches)
     const sorted = allFilePaths
       .filter((p) => (relevanceMap.get(p) ?? 0) > 0)
       .sort((a, b) => (relevanceMap.get(b) ?? 0) - (relevanceMap.get(a) ?? 0));
     const seeds = new Set(sorted.slice(0, 10));
 
-    // Step 3: Import graph traversal — walk out 2 hops from seeds
+    // Step 5: Import graph traversal — walk out 2 hops from seeds
     const dependencyMap = new Map<string, number>();
     for (const seed of seeds) {
-      dependencyMap.set(seed, 1.0); // seed itself gets max dep score
+      dependencyMap.set(seed, 1.0);
       const hop1 = graph.importGraph.get(seed) ?? [];
       for (const dep of hop1) {
         if (graph.files.has(dep)) {
-          const existing = dependencyMap.get(dep) ?? 0;
-          dependencyMap.set(dep, Math.max(existing, 0.7));
+          dependencyMap.set(dep, Math.max(dependencyMap.get(dep) ?? 0, 0.7));
           const hop2 = graph.importGraph.get(dep) ?? [];
           for (const dep2 of hop2) {
             if (graph.files.has(dep2)) {
-              const existing2 = dependencyMap.get(dep2) ?? 0;
-              dependencyMap.set(dep2, Math.max(existing2, 0.4));
+              dependencyMap.set(dep2, Math.max(dependencyMap.get(dep2) ?? 0, 0.4));
             }
           }
         }
       }
     }
 
-    // Step 4: Memory linkage — boost error signal for files in past change records
+    // Step 6: Memory linkage — error signal from past change records
     const candidateFiles = allFilePaths.filter(
       (p) => (relevanceMap.get(p) ?? 0) > 0 || dependencyMap.has(p)
     );
@@ -84,18 +148,16 @@ export class RetrievalEngine {
 
     const errorSignalMap = new Map<string, number>();
     for (const record of memoryRecords) {
-      // Simple string overlap on description vs query
       const descTokens = tokenizeQuery(record.description);
       const overlap =
         descTokens.filter((t) => tokens.includes(t)).length / Math.max(tokens.length, 1);
       const boost = overlap * (record.outcome === 'failure' ? 1.0 : 0.5);
       for (const file of record.files) {
-        const existing = errorSignalMap.get(file) ?? 0;
-        errorSignalMap.set(file, Math.min(1, existing + boost));
+        errorSignalMap.set(file, Math.min(1, (errorSignalMap.get(file) ?? 0) + boost));
       }
     }
 
-    // Step 5: Build ContextCandidate list
+    // Step 7: Build ContextCandidate list
     const candidates: ContextCandidate[] = [];
     const visited = new Set<string>();
 
@@ -114,20 +176,14 @@ export class RetrievalEngine {
           recency: 0, // computed in scorer
           errorSignal: errorSignalMap.get(filePath) ?? 0,
         },
-        finalScore: 0, // computed in scorer
+        finalScore: 0,
         tokenEstimate: Math.ceil(fileNode.size / 4),
       });
     };
 
-    for (const filePath of candidateFiles) {
-      addCandidate(filePath);
-    }
-    // Also include any dependency-reachable files not yet added
-    for (const filePath of dependencyMap.keys()) {
-      addCandidate(filePath);
-    }
+    for (const p of candidateFiles) addCandidate(p);
+    for (const p of dependencyMap.keys()) addCandidate(p);
 
-    // Sort by combined raw signals, return topK
     candidates.sort(
       (a, b) =>
         b.scores.relevance + b.scores.dependency + b.scores.errorSignal -

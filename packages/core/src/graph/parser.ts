@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileNode, FunctionNode, ClassNode } from '../types';
+import { GraphCache } from './cache';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const TreeSitter = require('tree-sitter');
@@ -215,19 +216,27 @@ function extractExports(tree: SyntaxNode): string[] {
 
 export class Parser {
   private tsParser: typeof TreeSitter;
+  private cache: GraphCache | null;
 
-  constructor() {
+  constructor(cache?: GraphCache) {
     this.tsParser = new TreeSitter();
+    this.cache = cache ?? null;
   }
 
   async parseFile(filePath: string): Promise<FileNode> {
     const ext = path.extname(filePath).toLowerCase();
     const lang = LANGUAGE_MAP[ext];
     const language = detectLanguage(filePath);
+    const stat = await fs.promises.stat(filePath);
+
+    // Check incremental cache first — skip re-parsing if mtime unchanged
+    if (this.cache) {
+      const cached = this.cache.get(filePath, stat.mtimeMs);
+      if (cached) return cached;
+    }
 
     if (!lang) {
-      const stat = await fs.promises.stat(filePath);
-      return {
+      const node: FileNode = {
         path: filePath,
         language: 'unknown',
         functions: [],
@@ -237,15 +246,16 @@ export class Parser {
         lastModified: stat.mtimeMs,
         size: stat.size,
       };
+      this.cache?.set(filePath, stat.mtimeMs, node);
+      return node;
     }
 
     this.tsParser.setLanguage(lang);
     const source = await fs.promises.readFile(filePath, 'utf8');
-    const stat = await fs.promises.stat(filePath);
     const tree = this.tsParser.parse(source);
     const root = tree.rootNode as SyntaxNode;
 
-    return {
+    const node: FileNode = {
       path: filePath,
       language,
       functions: extractFunctions(root, language),
@@ -255,6 +265,9 @@ export class Parser {
       lastModified: stat.mtimeMs,
       size: stat.size,
     };
+
+    this.cache?.set(filePath, stat.mtimeMs, node);
+    return node;
   }
 
   async parseRepo(

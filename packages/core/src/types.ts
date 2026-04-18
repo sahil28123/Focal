@@ -81,7 +81,8 @@ export interface IncludedFile {
 
 // Config for a Focal.build() call
 export interface FocalConfig {
-  repoPath: string;
+  // V1: single repo. V2: array of repo paths for multi-repo support.
+  repoPath: string | string[];
   query: string;
   tokenBudget?: number;       // default: 8000
   weights?: {
@@ -92,4 +93,14 @@ export interface FocalConfig {
   };
   exclude?: string[];         // glob patterns to exclude
   memoryPath?: string;        // path to store change memory (default: .focal/)
+
+  // V2: optional LLM summary callback — bring your own LLM, no Focal dependency
+  // Called when a file is too large for full inclusion but budget remains.
+  // Return a concise summary string to use as the file's content.
+  summarize?: (content: string, query: string, filePath: string) => Promise<string>;
+
+  // V2: optional embedding function — bring your own model, no Focal dependency
+  // Receives an array of texts, returns an array of embedding vectors.
+  // When provided, used to boost relevance scores via cosine similarity.
+  embed?: (texts: string[]) => Promise<number[][]>;
 }
